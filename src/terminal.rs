@@ -319,7 +319,7 @@ fn set_nonblocking(fd: libc::c_int) -> io::Result<()> {
 
 async fn read_once(master: &AsyncFd<OwnedFd>, buffer: &mut [u8]) -> io::Result<usize> {
     loop {
-        let guard = master.readable().await?;
+        let mut guard = master.readable().await?;
         match guard.try_io(|inner| read(inner.get_ref().as_raw_fd(), buffer).map_err(errno)) {
             Ok(result) => return result,
             Err(_would_block) => continue,
@@ -330,7 +330,7 @@ async fn read_once(master: &AsyncFd<OwnedFd>, buffer: &mut [u8]) -> io::Result<u
 async fn write_all(master: &AsyncFd<OwnedFd>, data: &[u8]) -> io::Result<()> {
     let mut offset = 0;
     while offset < data.len() {
-        let guard = master.writable().await?;
+        let mut guard = master.writable().await?;
         match guard.try_io(|inner| write(inner.get_ref(), &data[offset..]).map_err(errno)) {
             Ok(Ok(size)) if size > 0 => offset += size,
             Ok(Ok(_)) => return Err(io::Error::new(io::ErrorKind::WriteZero, "PTY write returned zero")),

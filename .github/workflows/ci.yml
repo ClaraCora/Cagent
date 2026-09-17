@@ -27,3 +27,12 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+      - name: Export formatting corrections
+        if: failure()
+        run: cargo fmt --all && git diff > formatting.patch
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: formatting
+          path: formatting.patch

@@ -305,7 +305,7 @@ async fn session(
                                     respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx);
                                 }
                             } else if rpc.method.starts_with("terminal.") {
-                                terminals.handle(&rpc.method, rpc.params, &result_tx).await;
+                                terminals.handle(&rpc.method, rpc.params, &result_tx, url.starts_with("wss://") || is_loopback(url)).await;
                             }
                         }
                     }

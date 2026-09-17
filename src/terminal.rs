@@ -24,6 +24,7 @@ const MAX_INPUT: usize = 8 * 1024;
 const MAX_COLS: u32 = 500;
 const MAX_ROWS: u32 = 200;
 const OUTPUT_BUFFER: usize = 64;
+const MAX_SESSIONS: usize = 4;
 
 #[derive(Default)]
 pub struct Manager {
@@ -68,7 +69,8 @@ struct ResizeParams {
 
 impl Manager {
     /// Handles one terminal notification received from the hub.
-    pub async fn handle(&mut self, method: &str, params: Value, output: &mpsc::Sender<Message>) {
+    pub async fn handle(&mut self, method: &str, params: Value, output: &mpsc::Sender<Message>, secure: bool) {
+        self.sessions.retain(|_, entry| !entry.task.is_finished());
         match method {
             "terminal.open" => {
                 let Ok(params) = serde_json::from_value::<OpenParams>(params) else {
@@ -76,6 +78,12 @@ impl Manager {
                 };
                 if !valid_id(&params.terminal_id) || !valid_size(params.cols, params.rows) {
                     return self.send_error(&params.terminal_id, "终端窗口参数无效", output).await;
+                }
+                if !secure {
+                    return self.send_error(&params.terminal_id, "远程 Web Terminal 必须使用 WSS 加密连接", output).await;
+                }
+                if self.sessions.len() >= MAX_SESSIONS && !self.sessions.contains_key(&params.terminal_id) {
+                    return self.send_error(&params.terminal_id, "节点最多同时打开 4 个终端", output).await;
                 }
                 if unsafe { libc::geteuid() } != 0 {
                     return self
@@ -136,7 +144,9 @@ impl Manager {
     }
 
     async fn send_error(&self, id: &str, message: &str, output: &mpsc::Sender<Message>) {
-        let _ = output.send(notify("terminal.error", json!({ "terminal_id": id, "message": message }))).await;
+        // This runs in the connection's receive loop, which also drains output.
+        // Waiting on a full queue here would deadlock the entire agent.
+        let _ = output.try_send(notify("terminal.error", json!({ "terminal_id": id, "message": message })));
     }
 
     pub fn close_all(&mut self) {
@@ -144,6 +154,12 @@ impl Manager {
             let _ = entry.tx.try_send(Command::Close);
             entry.task.abort();
         }
+    }
+}
+
+impl Drop for Manager {
+    fn drop(&mut self) {
+        self.close_all();
     }
 }
 
@@ -357,6 +373,37 @@ fn errno(error: nix::errno::Errno) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn plaintext_terminal_is_refused_without_starting_a_shell() {
+        let mut manager = Manager::default();
+        let (tx, mut rx) = mpsc::channel(1);
+        manager.handle("terminal.open", json!({"terminal_id":"test", "cols":80, "rows":24}), &tx, false).await;
+        assert!(manager.sessions.is_empty());
+        assert!(rx.recv().await.unwrap().to_string().contains("WSS"));
+        // A second refusal with a full output queue must never block the RPC loop.
+        tx.try_send(Message::Ping(Vec::new().into())).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), manager.handle("terminal.open", json!({}), &tx, true)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_limit_and_drop_bound_root_processes() {
+        let mut manager = Manager::default();
+        let (output, mut rx) = mpsc::channel(1);
+        let mut aborted = Vec::new();
+        for n in 0..MAX_SESSIONS {
+            let (tx, _rx) = mpsc::channel(1);
+            let task = tokio::spawn(std::future::pending());
+            aborted.push(task.abort_handle());
+            manager.sessions.insert(n.to_string(), Entry { tx, task });
+        }
+        manager.handle("terminal.open", json!({"terminal_id":"overflow", "cols":80, "rows":24}), &output, true).await;
+        assert!(rx.recv().await.unwrap().to_string().contains("4"));
+        assert_eq!(manager.sessions.len(), MAX_SESSIONS);
+        drop(manager);
+        tokio::task::yield_now().await;
+        assert!(aborted.iter().all(|task| task.is_finished()));
+    }
 
     #[test]
     fn terminal_inputs_are_bounded_and_ids_are_local_tokens() {

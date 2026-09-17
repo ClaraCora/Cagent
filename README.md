@@ -10,7 +10,9 @@
 - 内存对齐 `free(1)` 的 used 列，磁盘对齐 `df(1)` 的 Used 列
 - 无状态：不写文件，不保存跨重启的数据，流量累加由 hub 负责
 - token 走 `Authorization` 头，不进反向代理的 access log
-- 非回环地址拒绝明文 `ws://`
+- 默认拒绝非回环地址的明文 `ws://`；即使显式启用 `--insecure`，远程明文连接也不能打开终端
+- 每节点最多 4 个终端，断线清理交互 shell，输出拥塞不会阻塞 Agent 的通信循环
+- `v1.1.3` 修复 TLS 握手漏洞 RUSTSEC-2026-0285
 - Web terminal 由本机 agent 打开 PTY，终端命令以 `root` 权限执行
 
 ## 安装
@@ -51,7 +53,7 @@ monitor-agent --server https://your-hub --token <token>
 
 ## 构建
 
-需要 Rust stable。
+所有构建、测试与发布使用 GitHub Actions 的 Linux runner，需要 Rust stable。以下命令在 runner 执行：
 
 ```bash
 cargo build --release

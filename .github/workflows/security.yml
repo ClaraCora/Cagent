@@ -1,0 +1,17 @@
+name: security
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.lock, Cargo.toml, web-admin/package-lock.json, .github/workflows/security.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit

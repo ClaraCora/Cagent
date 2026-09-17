@@ -77,6 +77,15 @@ impl Manager {
                 if !valid_id(&params.terminal_id) || !valid_size(params.cols, params.rows) {
                     return self.send_error(&params.terminal_id, "终端窗口参数无效", output).await;
                 }
+                if unsafe { libc::geteuid() } != 0 {
+                    return self
+                        .send_error(
+                            &params.terminal_id,
+                            "Cagent 未以 root 运行，请重新执行节点安装命令",
+                            output,
+                        )
+                        .await;
+                }
                 self.close(&params.terminal_id);
                 let (tx, rx) = mpsc::channel(OUTPUT_BUFFER);
                 let id = params.terminal_id.clone();

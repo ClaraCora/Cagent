@@ -11,7 +11,7 @@
 - 无状态：不写文件，不保存跨重启的数据，流量累加由 hub 负责
 - token 走 `Authorization` 头，不进反向代理的 access log
 - 非回环地址拒绝明文 `ws://`
-- Web terminal 由本机 agent 打开 PTY，终端命令以 `monitor-agent` 服务用户权限执行
+- Web terminal 由本机 agent 打开 PTY，终端命令以 `root` 权限执行
 
 ## 安装
 
@@ -22,7 +22,8 @@ curl -fsSL https://your-hub/install.sh | sh -s -- --server https://your-hub --to
 ```
 
 安装脚本识别 systemd 与 OpenRC，二进制装到 `/opt/monitor/monitor-agent`，token 写入
-`/opt/monitor/agent.env`（0600）——和 hub 同一个目录，那台机器上只有这一处要看。
+`/opt/monitor/agent.env`（0600）——和 hub 同一个目录，那台机器上只有这一处要看。Agent
+服务以 `root` 运行，因此登录 Cmonitor 后台的管理员可以通过 Web Terminal 完整管理节点。
 
 ## 运行
 

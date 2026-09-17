@@ -1,6 +1,7 @@
 //! monitor-agent: reports one Linux host to a monitor hub over WebSocket.
 
 mod collect;
+mod terminal;
 
 use std::time::Duration;
 
@@ -171,6 +172,11 @@ fn remaining(last_frame: Instant) -> Duration {
 async fn main() -> Result<()> {
     let args = parse_args()?;
     let url = ws_url(&args.server, args.insecure)?;
+    // systemd provides the token through EnvironmentFile. Do not let a shell
+    // opened later by the terminal expose that credential through `env` or
+    // `/proc/<pid>/environ`.
+    std::env::remove_var("MONITOR_TOKEN");
+    std::env::remove_var("MONITOR_SERVER");
     // Reported once at startup. install.sh hardens this unit with
     // ProtectHome=yes, which mounts a tmpfs over /home; where /home is its own
     // filesystem the totals then omit it. The unit file owns that decision, but
@@ -268,6 +274,7 @@ async fn session(
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
+    let mut terminals = terminal::Manager::default();
     let mut ticker = tokio::time::interval(Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -297,6 +304,8 @@ async fn session(
                                 if let Ok(tasks) = serde_json::from_value::<Vec<PingTask>>(rpc.params) {
                                     respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx);
                                 }
+                            } else if rpc.method.starts_with("terminal.") {
+                                terminals.handle(&rpc.method, rpc.params, &result_tx).await;
                             }
                         }
                     }
@@ -313,6 +322,7 @@ async fn session(
     for (_, handle) in ping_tasks {
         handle.abort();
     }
+    terminals.close_all();
     result
 }
 

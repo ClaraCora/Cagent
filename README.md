@@ -1,6 +1,6 @@
-# monitor-agent
+# Cagent
 
-[monitor](https://github.com/monitor-probe/monitor) 的 Linux agent。采集本机指标，经 WebSocket 上报 hub。
+[Cmonitor](https://github.com/ClaraCora/Cmonitor) 的 Linux agent。采集本机指标，经 WebSocket 上报 hub。
 
 静态链接单文件，无运行时依赖，常驻内存数 MB。
 
@@ -11,6 +11,7 @@
 - 无状态：不写文件，不保存跨重启的数据，流量累加由 hub 负责
 - token 走 `Authorization` 头，不进反向代理的 access log
 - 非回环地址拒绝明文 `ws://`
+- Web terminal 由本机 agent 打开 PTY，终端命令以 `monitor-agent` 服务用户权限执行
 
 ## 安装
 
@@ -45,7 +46,7 @@ monitor-agent --server https://your-hub --token <token>
 `net_rx_total` / `net_tx_total` 为内核 lifetime 计数器，原样上报；`boot_id` 取自
 `/proc/sys/kernel/random/boot_id`，是 hub 判定主机重启的唯一依据，**不要删**。
 
-协议说明见 [hub 仓库](https://github.com/monitor-probe/monitor)。
+协议说明见 [hub 仓库](https://github.com/ClaraCora/Cmonitor)。
 
 ## 构建
 

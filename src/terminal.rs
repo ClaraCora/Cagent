@@ -223,7 +223,10 @@ impl Pty {
         }
         let child = command.spawn().context("start shell")?;
         let pid = Pid::from_raw(child.id().ok_or_else(|| anyhow::anyhow!("shell has no process id"))? as i32);
-        Ok(Self { master: AsyncFd::new(pair.master)?, child, pid })
+        // SAFETY: AsyncFd owns this OwnedFd until deregistration. It is never
+        // replaced or closed through a raw descriptor while registered.
+        let master = unsafe { AsyncFd::register(pair.master)? };
+        Ok(Self { master, child, pid })
     }
 
     fn resize(&self, cols: u32, rows: u32) -> Result<()> {

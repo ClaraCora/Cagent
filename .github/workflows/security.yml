@@ -2,7 +2,9 @@ name: security
 on:
   push:
     branches: [main]
-    paths: [Cargo.lock, Cargo.toml, web-admin/package-lock.json, .github/workflows/security.yml]
+    paths: [Cargo.lock, Cargo.toml, .github/workflows/security.yml]
+  pull_request:
+    paths: [Cargo.lock, Cargo.toml, .github/workflows/security.yml]
   workflow_dispatch:
 permissions:
   contents: read
@@ -14,4 +16,4 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install cargo-audit --locked
-      - run: cargo audit
+      - run: cargo audit --deny unsound

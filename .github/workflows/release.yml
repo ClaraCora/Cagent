@@ -9,7 +9,16 @@ permissions:
   contents: write
 
 jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit --deny unsound
+
   build:
+    needs: security
     runs-on: ubuntu-latest
     strategy:
       matrix:

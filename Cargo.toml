@@ -12,7 +12,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # A single-threaded runtime suffices: one report every few seconds plus a
 # handful of TCP probes.
-tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util", "process"] }
+tokio = { version = "1.53.3", features = ["rt", "macros", "net", "time", "sync", "io-util", "process"] }
 rustix = { version = "1", features = ["fs"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 nix = { version = "0.29", default-features = false, features = ["process", "signal", "term"] }
@@ -20,7 +20,7 @@ libc = "0.2"
 # tokio-tungstenite 0.28 leaves the crypto provider to the caller: rustls
 # selects one automatically only when exactly one provider feature is enabled.
 # Without this the agent panics on its first wss:// connection.
-rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 if-addrs = "0.15.0"
 

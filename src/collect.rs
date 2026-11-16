@@ -167,7 +167,7 @@ impl Collector {
         let (tcp, udp) = conn_counts();
 
         Metrics {
-            boot_id: read_trim("/proc/sys/kernel/random/boot_id").unwrap_or_default(),
+            boot_id: accounting_boot_id(),
             uptime: uptime(),
             cpu: self.cpu_percent(),
             load: loadavg(),
@@ -345,7 +345,7 @@ fn parse_net_dev(text: &str) -> (u64, u64) {
     for line in text.lines().skip(2) {
         let Some((name, rest)) = line.split_once(':') else { continue };
         let name = name.trim();
-        if skip_iface(name) || is_stacked(name) {
+        if !account_iface(name) {
             continue;
         }
         let f: Vec<u64> = rest.split_whitespace().filter_map(|v| v.parse().ok()).collect();
@@ -355,6 +355,57 @@ fn parse_net_dev(text: &str) -> (u64, u64) {
         }
     }
     (rx, tx)
+}
+
+fn accounting_config() -> &'static (String, String) {
+    static CONFIG: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    CONFIG.get_or_init(|| {
+        (
+            std::env::var("MONITOR_NET_INCLUDE").unwrap_or_default(),
+            std::env::var("MONITOR_NET_EXCLUDE").unwrap_or_default(),
+        )
+    })
+}
+fn interface_selected(name: &str, include: &str, exclude: &str) -> bool {
+    let matches = |list: &str| {
+        list.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .any(|s| s.strip_suffix('*').map_or(name == s, |prefix| name.starts_with(prefix)))
+    };
+    if matches(exclude) {
+        return false;
+    }
+    if !include.trim().is_empty() {
+        matches(include)
+    } else {
+        !skip_iface(name) && !is_stacked(name)
+    }
+}
+fn account_iface(name: &str) -> bool {
+    let (include, exclude) = accounting_config();
+    interface_selected(name, include, exclude)
+}
+pub fn active_interfaces() -> Vec<String> {
+    fs::read_to_string("/proc/net/dev")
+        .unwrap_or_default()
+        .lines()
+        .skip(2)
+        .filter_map(|line| line.split_once(':').map(|(n, _)| n.trim()))
+        .filter(|n| account_iface(n))
+        .map(str::to_owned)
+        .collect()
+}
+fn accounting_boot_id() -> String {
+    let boot = read_trim("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+    let (include, exclude) = accounting_config();
+    if include.is_empty() && exclude.is_empty() {
+        return boot;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    (include, exclude).hash(&mut hash);
+    format!("{boot}:net:{:x}", hash.finish())
 }
 
 fn skip_iface(name: &str) -> bool {
@@ -827,5 +878,14 @@ mod crosscheck {
             .unwrap_or_else(|e| panic!("{program}(1) is what these numbers are checked against: {e}"));
         assert!(out.status.success(), "{program} exited with {}", out.status);
         String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+    #[test]
+    fn explicit_network_scope_has_predictable_precedence() {
+        assert!(!interface_selected("docker0", "", ""));
+        assert!(interface_selected("docker0", "docker*", ""));
+        assert!(!interface_selected("eth1", "eth*", "eth1"));
+        assert!(!interface_selected("ens3", "eth0", ""));
+        assert!(interface_selected("eth0", "eth0", ""));
+        assert!(!interface_selected("eth01", "eth0", ""));
     }
 }

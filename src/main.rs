@@ -28,6 +28,7 @@ struct Args {
     /// Permits plain HTTP to a hub reached at ip:port with no TLS in front.
     /// Off by default: the token would otherwise travel in the clear.
     insecure: bool,
+    disable_terminal: bool,
 }
 
 fn usage() -> ! {
@@ -43,11 +44,14 @@ fn usage() -> ! {
                                 at ip:port with no TLS in front.\n",
         env!("CARGO_PKG_VERSION")
     );
+    eprintln!("  --disable-terminal   Disable root terminal locally\n  --net-include <list>  Count only named interfaces (comma separated, suffix *)\n  --net-exclude <list>  Exclude named interfaces; takes precedence");
     std::process::exit(2)
 }
 
 fn parse_args() -> Result<Args> {
     let (mut server, mut token, mut interval, mut insecure) = (None, None, 1u64, false);
+    let mut disable_terminal =
+        std::env::var("MONITOR_DISABLE_TERMINAL").is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
@@ -56,13 +60,16 @@ fn parse_args() -> Result<Args> {
             "--token" => token = Some(value()),
             "--interval" => interval = value().parse().unwrap_or_else(|_| usage()),
             "--insecure" => insecure = true,
+            "--disable-terminal" => disable_terminal = true,
+            "--net-include" => std::env::set_var("MONITOR_NET_INCLUDE", value()),
+            "--net-exclude" => std::env::set_var("MONITOR_NET_EXCLUDE", value()),
             "-h" | "--help" => usage(),
             other => bail!("unknown argument: {other}"),
         }
     }
     let server = server.or_else(|| std::env::var("MONITOR_SERVER").ok()).unwrap_or_else(|| usage());
     let token = token.or_else(|| std::env::var("MONITOR_TOKEN").ok()).unwrap_or_else(|| usage());
-    Ok(Args { server, token, interval: interval.clamp(1, 3600), insecure })
+    Ok(Args { server, token, interval: interval.clamp(1, 3600), insecure, disable_terminal })
 }
 
 /// `https://host/path` -> `wss://host/path/api/agent/ws`. The token travels in
@@ -193,7 +200,10 @@ async fn main() -> Result<()> {
         // that ran. `None` means never connected, which keeps the backoff
         // doubling.
         let mut connected = None;
-        if let Err(e) = session(&url, &args.token, &mut collector, args.interval, &mut connected).await {
+        if let Err(e) =
+            session(&url, &args.token, &mut collector, args.interval, !args.disable_terminal, &mut connected)
+                .await
+        {
             eprintln!("session ended: {e:#}");
         }
         wait = reconnect_wait(wait, connected.map_or(Duration::ZERO, |t: Instant| t.elapsed()));
@@ -251,6 +261,7 @@ async fn session(
     token: &str,
     collector: &mut Collector,
     interval: u64,
+    terminal_enabled: bool,
     connected: &mut Option<Instant>,
 ) -> Result<()> {
     let mut request = url.into_client_request()?;
@@ -270,7 +281,10 @@ async fn session(
     // every other write, so no two writes can each claim a full HUB_SILENCE.
     let mut last_frame = Instant::now();
 
-    send(&mut ws, notify("hello", serde_json::to_value(collector.facts())?), remaining(last_frame)).await?;
+    let mut facts = serde_json::to_value(collector.facts())?;
+    facts["terminal_enabled"] = serde_json::json!(terminal_enabled);
+    facts["network_interfaces"] = serde_json::json!(collect::active_interfaces());
+    send(&mut ws, notify("hello", facts), remaining(last_frame)).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
@@ -304,6 +318,9 @@ async fn session(
                                 if let Ok(tasks) = serde_json::from_value::<Vec<PingTask>>(rpc.params) {
                                     respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx);
                                 }
+                            } else if rpc.method == "terminal.open" && !terminal_enabled {
+                                let id = rpc.params.get("terminal_id").cloned().unwrap_or_default();
+                                let _ = result_tx.try_send(notify("terminal.error", serde_json::json!({"terminal_id": id, "message": "Agent 已在本机禁用 Web Terminal"})));
                             } else if rpc.method.starts_with("terminal.") {
                                 terminals.handle(&rpc.method, rpc.params, &result_tx, url.starts_with("wss://") || is_loopback(url)).await;
                             }
@@ -367,25 +384,21 @@ fn respawn_ping_tasks(
             // back: the default burst behaviour would turn one stalled
             // resolution into a rapid series of connects.
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // Logged once per probe per session: a resolver that overruns does
-            // so every round, and the resulting gap would otherwise be
-            // unexplained.
-            let mut said = false;
             loop {
                 ticker.tick().await;
-                let Some(latency) = tcp_ping(&spawned.target).await else {
-                    if !std::mem::replace(&mut said, true) {
-                        eprintln!(
-                            "{}: name resolution runs past {}ms, so these rounds report no sample \
-                             rather than a loss",
-                            spawned.target,
-                            HANDSHAKE_DEADLINE.as_millis()
-                        );
-                    }
-                    continue;
+                let latency = tcp_ping(&spawned.target).await;
+                let reason = match latency {
+                    -2 => Some("dns_timeout"),
+                    -3 => Some("dns_error"),
+                    -1 => Some("tcp_timeout"),
+                    _ => None,
                 };
-                let msg =
-                    notify("ping.result", serde_json::json!({"task_id": spawned.id, "latency_ms": latency}));
+                let msg = notify(
+                    "ping.result",
+                    serde_json::json!({
+                        "task_id": spawned.id, "latency_ms": latency, "reason": reason
+                    }),
+                );
                 if tx.send(msg).await.is_err() {
                     return;
                 }
@@ -413,38 +426,26 @@ const HANDSHAKE_DEADLINE: Duration = Duration::from_millis(900);
 /// outlast the five-second floor on its own interval.
 const MAX_PING_ADDRS: usize = 3;
 
-/// Round-trip time of a TCP handshake in milliseconds; -1 when no address
-/// answered within [`HANDSHAKE_DEADLINE`], `None` when the name could not be
-/// resolved in that time.
-///
-/// The two failure modes must stay distinct. -1 is the protocol's word for a
-/// target that did not answer, and the hub folds every negative reading into a
-/// bucket's packet loss, so returning it for a slow resolver would draw loss on
-/// a link that dropped nothing. An overrun resolution is a sample not taken,
-/// which is not a reading of zero.
-///
-/// The name is resolved before the clock starts: `TcpStream::connect` on a
-/// hostname resolves first and connects second, which would fold resolver
-/// latency into every sample. glibc caches nothing, so this happens each round.
-///
-/// ponytail: the `None` arm has no runtime reproduction; forcing it would
-/// require either a genuinely overrunning resolver or a test-only deadline
-/// parameter. The assertions below spell `Some(-1)`, so collapsing the two
-/// answers back into one `i32` fails to compile.
-async fn tcp_ping(target: &str) -> Option<i32> {
+/// TCP handshake latency; -1 means connection failure, -2 DNS deadline,
+/// and -3 DNS error. DNS errors are observations, never packet-loss samples.
+async fn tcp_ping(target: &str) -> i32 {
+    ping_with_lookup(tokio::net::lookup_host(target)).await
+}
+async fn ping_with_lookup<I: Iterator<Item = std::net::SocketAddr>>(
+    lookup: impl std::future::Future<Output = std::io::Result<I>>,
+) -> i32 {
     // Bounded by the handshake deadline: a resolution slower than a connect is
     // useless as a latency sample, and `lookup_host` has no deadline of its own
     // -- glibc against a black-holed nameserver takes tens of seconds.
     //
     // This does not cancel the underlying `getaddrinfo`, which runs to
     // completion on a blocking thread; it only keeps this probe on cadence.
-    let Ok(resolved) = tokio::time::timeout(HANDSHAKE_DEADLINE, tokio::net::lookup_host(target)).await else {
-        return None;
+    let Ok(resolved) = tokio::time::timeout(HANDSHAKE_DEADLINE, lookup).await else {
+        return -2;
     };
-    // A resolution error is an unreachable target, which is what -1 reports.
-    // Only the deadline above is ambiguous.
-    let Ok(addresses) = resolved else { return Some(-1) };
-    Some(handshake(addresses).await)
+    // Resolver failures have their own status and are excluded from link loss.
+    let Ok(addresses) = resolved else { return -3 };
+    handshake(addresses).await
 }
 
 /// Round-trip time of the first address that completes a handshake.
@@ -539,12 +540,12 @@ mod tests {
         // A loopback handshake completes within a millisecond, so this reads 0
         // either way; what it pins is the contract that reachable is
         // non-negative and unreachable is -1.
-        assert!(tcp_ping(&addr.to_string()).await.unwrap() >= 0);
-        assert_eq!(tcp_ping("127.0.0.1:1").await, Some(-1), "nothing is listening there");
+        assert!(tcp_ping(&addr.to_string()).await >= 0);
+        assert_eq!(tcp_ping("127.0.0.1:1").await, -1, "nothing is listening there");
         // A failed resolution is an unreachable target, not a missing sample.
         // std rejects this port before the resolver is reached, so the
         // assertion needs no network.
-        assert_eq!(tcp_ping("127.0.0.1:99999").await, Some(-1), "an unresolvable target is unreachable");
+        assert_eq!(tcp_ping("127.0.0.1:99999").await, -3, "an unresolvable target is unreachable");
 
         // First address dead: a dual-stack target on a host whose v6 goes
         // nowhere. The probe advances rather than reporting it unreachable.
@@ -684,5 +685,14 @@ mod tests {
         let flood = (0..500).map(|id| task(id, "f:6", 60)).collect();
         respawn_ping_tasks(&mut running, flood, &tx);
         assert_eq!(running.len(), MAX_PING_TASKS, "the hub does not choose how many probes run");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn dns_deadline_is_a_reported_error_not_a_lost_tcp_packet() {
+        let lookup = std::future::pending::<std::io::Result<std::vec::IntoIter<std::net::SocketAddr>>>();
+        assert_eq!(ping_with_lookup(lookup).await, -2);
+        let lookup = std::future::ready(Err::<std::vec::IntoIter<std::net::SocketAddr>, _>(
+            std::io::Error::other("dns"),
+        ));
+        assert_eq!(ping_with_lookup(lookup).await, -3);
     }
 }

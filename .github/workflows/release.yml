@@ -9,6 +9,11 @@ permissions:
   contents: write
 
 jobs:
+  checks:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
   security:
     runs-on: ubuntu-latest
     steps:
@@ -18,7 +23,7 @@ jobs:
       - run: cargo audit --deny unsound
 
   build:
-    needs: security
+    needs: [checks, security]
     runs-on: ubuntu-latest
     strategy:
       matrix:

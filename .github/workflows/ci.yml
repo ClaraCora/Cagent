@@ -1,6 +1,7 @@
 name: ci
 
 on:
+  workflow_call:
   push:
     branches: [main]
     # Prose changes nothing a compiler or linter can check.

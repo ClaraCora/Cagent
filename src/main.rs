@@ -282,7 +282,15 @@ async fn session(
     let mut last_frame = Instant::now();
 
     let mut facts = serde_json::to_value(collector.facts())?;
-    facts["terminal_enabled"] = serde_json::json!(terminal_enabled);
+    let secure_transport = url.starts_with("wss://") || is_loopback(url);
+    facts["terminal_enabled"] = serde_json::json!(terminal_enabled && secure_transport);
+    facts["terminal_reason"] = serde_json::json!(if !terminal_enabled {
+        "policy"
+    } else if !secure_transport {
+        "plaintext"
+    } else {
+        "available"
+    });
     facts["network_interfaces"] = serde_json::json!(collect::active_interfaces());
     send(&mut ws, notify("hello", facts), remaining(last_frame)).await?;
 
@@ -322,7 +330,7 @@ async fn session(
                                 let id = rpc.params.get("terminal_id").cloned().unwrap_or_default();
                                 let _ = result_tx.try_send(notify("terminal.error", serde_json::json!({"terminal_id": id, "message": "Agent 已在本机禁用 Web Terminal"})));
                             } else if rpc.method.starts_with("terminal.") {
-                                terminals.handle(&rpc.method, rpc.params, &result_tx, url.starts_with("wss://") || is_loopback(url)).await;
+                                terminals.handle(&rpc.method, rpc.params, &result_tx, secure_transport).await;
                             }
                         }
                     }

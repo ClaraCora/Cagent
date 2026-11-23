@@ -12,7 +12,7 @@ use std::process::Stdio;
 use anyhow::{Context, Result};
 use nix::pty::Winsize;
 use nix::sys::signal::{kill, Signal};
-use nix::unistd::{read, write, Pid};
+use nix::unistd::{read, write, Pid, Uid, User};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::unix::AsyncFd;
@@ -93,7 +93,7 @@ impl Manager {
                 if self.sessions.len() >= MAX_SESSIONS && !self.sessions.contains_key(&params.terminal_id) {
                     return self.send_error(&params.terminal_id, "节点最多同时打开 4 个终端", output).await;
                 }
-                if unsafe { libc::geteuid() } != 0 {
+                if !Uid::effective().is_root() {
                     return self
                         .send_error(
                             &params.terminal_id,
@@ -233,9 +233,19 @@ impl Pty {
         let stdin = slave.try_clone().context("clone PTY slave")?;
         let stdout = slave.try_clone().context("clone PTY slave")?;
         let shell = if Path::new("/bin/bash").is_file() { "/bin/bash" } else { "/bin/sh" };
+        // The service's working directory and HOME can differ from the login account's.
+        let uid = Uid::effective();
+        let account = User::from_uid(uid)
+            .context("查询终端用户失败")?
+            .with_context(|| format!("找不到 UID {uid} 对应的系统用户"))?;
+        let home = &account.dir;
+        anyhow::ensure!(home.is_absolute(), "系统用户 {} 未配置有效的主目录", account.name);
+        anyhow::ensure!(home.is_dir(), "系统用户 {} 的主目录不可用：{}", account.name, home.display());
         let mut command = tokio::process::Command::new(shell);
         command
             .arg("-l")
+            .current_dir(home)
+            .env("HOME", home)
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(slave))
@@ -479,13 +489,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pty_runs_a_real_shell_and_returns_its_output() {
+    async fn pty_starts_the_login_shell_in_its_account_home() {
+        let account = User::from_uid(Uid::effective()).unwrap().unwrap();
+        let expected = format!("__cagent_home__{}\r\n", account.dir.display());
         let mut pty = Pty::spawn(80, 24).expect("PTY starts");
-        write_all(&pty.master, b"printf '__cagent_%s__\\n' pty_ready; exit\n").await.expect("write command");
+        write_all(&pty.master, b"test . -ef \"$HOME\" && printf '__cagent_%s__%s\\n' home \"$HOME\"; exit\n")
+            .await
+            .expect("write command");
         let mut collected = String::new();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let mut buffer = [0u8; 1024];
-            while !collected.contains("__cagent_pty_ready__") {
+            while !collected.contains(&expected) {
                 let read = read_once(&pty.master, &mut buffer).await.expect("read shell output");
                 assert!(read > 0, "shell ended before producing output");
                 collected.push_str(&String::from_utf8_lossy(&buffer[..read]));
@@ -495,6 +509,5 @@ mod tests {
         .expect("shell output deadline");
         pty.terminate();
         let _ = pty.child.wait().await;
-        assert!(collected.contains("__cagent_pty_ready__"));
     }
 }

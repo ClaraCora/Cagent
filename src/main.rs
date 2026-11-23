@@ -1,8 +1,12 @@
 //! monitor-agent: reports one Linux host to a monitor hub over WebSocket.
 
 mod collect;
+mod credentials;
+mod probe_policy;
 mod terminal;
 
+use probe_policy::Probes;
+use std::sync::Arc;
 use std::time::Duration;
 
 // Shares the clock `tokio::time::timeout` and `sleep` read, so deadline
@@ -34,10 +38,11 @@ struct Args {
 fn usage() -> ! {
     eprintln!(
         "monitor-agent {}\n\n\
-         Usage: monitor-agent --server <url> --token <token> [options]\n\n\
+         Usage: monitor-agent --server <url> [--token-file <path>] [options]\n\n\
          Options:\n  \
            --server <url>       Hub base URL, e.g. https://hub.example.com\n  \
-           --token <token>      Node token from the hub panel\n  \
+           --token-file <path>  Read the node token from a private file\n  \
+           --token <token>      Legacy argument, visible in process listings\n  \
            --interval <secs>    Report interval (default 1)\n  \
            --insecure           Allow plain ws:// to a remote hub; the token\n  \
                                 travels in the clear. Only for a hub reached\n  \
@@ -50,14 +55,16 @@ fn usage() -> ! {
 
 fn parse_args() -> Result<Args> {
     let (mut server, mut token, mut interval, mut insecure) = (None, None, 1u64, false);
+    let mut token_file = None;
     let mut disable_terminal =
-        std::env::var("MONITOR_DISABLE_TERMINAL").is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
+        credentials::terminal_disabled(std::env::var_os("MONITOR_DISABLE_TERMINAL").as_deref());
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
         match arg.as_str() {
             "--server" => server = Some(value()),
             "--token" => token = Some(value()),
+            "--token-file" => token_file = Some(value()),
             "--interval" => interval = value().parse().unwrap_or_else(|_| usage()),
             "--insecure" => insecure = true,
             "--disable-terminal" => disable_terminal = true,
@@ -68,7 +75,12 @@ fn parse_args() -> Result<Args> {
         }
     }
     let server = server.or_else(|| std::env::var("MONITOR_SERVER").ok()).unwrap_or_else(|| usage());
-    let token = token.or_else(|| std::env::var("MONITOR_TOKEN").ok()).unwrap_or_else(|| usage());
+    let token = match (token_file, token) {
+        (Some(_), Some(_)) => bail!("choose exactly one of --token-file and --token"),
+        (Some(file), None) => credentials::read_token(std::path::Path::new(&file))?,
+        (None, Some(token)) => token,
+        (None, None) => std::env::var("MONITOR_TOKEN").unwrap_or_else(|_| usage()),
+    };
     Ok(Args { server, token, interval: interval.clamp(1, 3600), insecure, disable_terminal })
 }
 
@@ -191,6 +203,10 @@ async fn main() -> Result<()> {
     for mount in collect::shadowed_mounts(&std::fs::read_to_string("/proc/self/mounts").unwrap_or_default()) {
         eprintln!("{mount} is covered by another mount and is not counted toward disk totals");
     }
+    let probes = Arc::new(Probes::new(
+        terminal_transport(&url),
+        &std::env::var("MONITOR_HTTP_PROBE_ALLOWLIST").unwrap_or_default(),
+    ));
     let mut collector = Collector::new();
     let mut wait = 0u64;
 
@@ -200,10 +216,7 @@ async fn main() -> Result<()> {
         // that ran. `None` means never connected, which keeps the backoff
         // doubling.
         let mut connected = None;
-        if let Err(e) =
-            session(&url, &args.token, &mut collector, args.interval, !args.disable_terminal, &mut connected)
-                .await
-        {
+        if let Err(e) = session(&url, &args, &mut collector, &probes, &mut connected).await {
             eprintln!("session ended: {e:#}");
         }
         wait = reconnect_wait(wait, connected.map_or(Duration::ZERO, |t: Instant| t.elapsed()));
@@ -255,15 +268,20 @@ const MAX_MESSAGE: usize = 64 * 1024;
 /// recovery at this constant rather than at tcp_retries2.
 const HUB_SILENCE: Duration = Duration::from_secs(90);
 
+fn terminal_transport(url: &str) -> bool {
+    url.starts_with("wss://")
+}
+
 /// One connection: handshake, then report until the socket closes.
 async fn session(
     url: &str,
-    token: &str,
+    args: &Args,
     collector: &mut Collector,
-    interval: u64,
-    terminal_enabled: bool,
+    probes: &Arc<Probes>,
     connected: &mut Option<Instant>,
 ) -> Result<()> {
+    let Args { token, interval, disable_terminal, .. } = args;
+    let terminal_enabled = !disable_terminal;
     let mut request = url.into_client_request()?;
     request
         .headers_mut()
@@ -282,7 +300,7 @@ async fn session(
     let mut last_frame = Instant::now();
 
     let mut facts = serde_json::to_value(collector.facts())?;
-    let secure_transport = url.starts_with("wss://") || is_loopback(url);
+    let secure_transport = terminal_transport(url);
     facts["terminal_enabled"] = serde_json::json!(terminal_enabled && secure_transport);
     facts["terminal_reason"] = serde_json::json!(if !terminal_enabled {
         "policy"
@@ -297,7 +315,7 @@ async fn session(
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut terminals = terminal::Manager::default();
-    let mut ticker = tokio::time::interval(Duration::from_secs(interval));
+    let mut ticker = tokio::time::interval(Duration::from_secs(*interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let result = loop {
@@ -324,7 +342,7 @@ async fn session(
                         if let Ok(rpc) = serde_json::from_str::<Rpc>(&text) {
                             if rpc.method == "ping.tasks" {
                                 if let Ok(tasks) = serde_json::from_value::<Vec<PingTask>>(rpc.params) {
-                                    respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx);
+                                    respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx, probes);
                                 }
                             } else if rpc.method == "terminal.open" && !terminal_enabled {
                                 let id = rpc.params.get("terminal_id").cloned().unwrap_or_default();
@@ -367,7 +385,9 @@ fn respawn_ping_tasks(
     running: &mut Vec<(PingTask, tokio::task::JoinHandle<()>)>,
     mut wanted: Vec<PingTask>,
     tx: &mpsc::Sender<Message>,
+    probes: &Arc<Probes>,
 ) {
+    wanted.retain(|task| probes.allowed(&task.target));
     if wanted.len() > MAX_PING_TASKS {
         // Silent truncation would leave no record of which probes run.
         eprintln!("hub asked for {} ping tasks, running {MAX_PING_TASKS}", wanted.len());
@@ -386,6 +406,7 @@ fn respawn_ping_tasks(
             continue;
         }
         let (tx, spawned) = (tx.clone(), task.clone());
+        let probes = Arc::clone(probes);
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(spawned.interval.clamp(5, 3600)));
             // As with the report ticker, missed ticks must not fire back to
@@ -394,7 +415,8 @@ fn respawn_ping_tasks(
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                let latency = tcp_ping(&spawned.target).await;
+                probes.pace().await;
+                let latency = tcp_ping(&spawned.target, &probes).await;
                 let reason = match latency {
                     -2 => Some("dns_timeout"),
                     -3 => Some("dns_error"),
@@ -436,8 +458,8 @@ const MAX_PING_ADDRS: usize = 3;
 
 /// TCP handshake latency; -1 means connection failure, -2 DNS deadline,
 /// and -3 DNS error. DNS errors are observations, never packet-loss samples.
-async fn tcp_ping(target: &str) -> i32 {
-    ping_with_lookup(tokio::net::lookup_host(target)).await
+async fn tcp_ping(target: &str, probes: &Probes) -> i32 {
+    ping_with_lookup(probes.resolve(target)).await
 }
 async fn ping_with_lookup<I: Iterator<Item = std::net::SocketAddr>>(
     lookup: impl std::future::Future<Output = std::io::Result<I>>,
@@ -477,6 +499,13 @@ async fn handshake(addresses: impl Iterator<Item = std::net::SocketAddr>) -> i32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plaintext_loopback_may_report_but_never_opens_a_terminal() {
+        let local = ws_url("http://127.0.0.1:28080", false).unwrap();
+        assert!(!terminal_transport(&local));
+        assert!(terminal_transport(&ws_url("https://hub.example", false).unwrap()));
+    }
 
     #[test]
     fn a_hub_restart_costs_a_second_while_an_unreachable_one_still_backs_off() {
@@ -542,18 +571,19 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_ping_measures_success_and_reports_failure() {
+        let probes = Probes::new(true, "");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { while listener.accept().await.is_ok() {} });
         // A loopback handshake completes within a millisecond, so this reads 0
         // either way; what it pins is the contract that reachable is
         // non-negative and unreachable is -1.
-        assert!(tcp_ping(&addr.to_string()).await >= 0);
-        assert_eq!(tcp_ping("127.0.0.1:1").await, -1, "nothing is listening there");
+        assert!(tcp_ping(&addr.to_string(), &probes).await >= 0);
+        assert_eq!(tcp_ping("127.0.0.1:1", &probes).await, -1, "nothing is listening there");
         // A failed resolution is an unreachable target, not a missing sample.
         // std rejects this port before the resolver is reached, so the
         // assertion needs no network.
-        assert_eq!(tcp_ping("127.0.0.1:99999").await, -3, "an unresolvable target is unreachable");
+        assert_eq!(tcp_ping("127.0.0.1:99999", &probes).await, -3, "an unresolvable target is unreachable");
 
         // First address dead: a dual-stack target on a host whose v6 goes
         // nowhere. The probe advances rather than reporting it unreachable.
@@ -663,10 +693,11 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let _g = rt.enter();
         let (tx, _rx) = mpsc::channel(8);
+        let probes = Arc::new(Probes::new(true, ""));
         let mut running = Vec::new();
         let task = |id, target: &str, interval| PingTask { id, target: target.into(), interval };
 
-        respawn_ping_tasks(&mut running, vec![task(1, "a:1", 60), task(2, "b:2", 60)], &tx);
+        respawn_ping_tasks(&mut running, vec![task(1, "a:1", 60), task(2, "b:2", 60)], &tx, &probes);
         assert_eq!(running.len(), 2);
         let (first, second) = (running[0].1.id(), running[1].1.id());
 
@@ -675,6 +706,7 @@ mod tests {
             &mut running,
             vec![task(1, "a:1", 60), task(2, "c:3", 60), task(3, "d:4", 60)],
             &tx,
+            &probes,
         );
         assert_eq!(running.len(), 3);
         assert_eq!(running[0].1.id(), first, "unchanged task must not be restarted");
@@ -684,14 +716,14 @@ mod tests {
 
         // Interval 0 must not take the probe down: tokio's interval panics on
         // a zero period, and a panicked task stops reporting silently.
-        respawn_ping_tasks(&mut running, vec![task(9, "e:5", 0)], &tx);
+        respawn_ping_tasks(&mut running, vec![task(9, "e:5", 0)], &tx, &probes);
         rt.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
         assert!(!running[0].1.is_finished(), "a zero interval must be clamped, not panic the probe");
 
         // One 64 KiB frame could carry some fifteen hundred of these; the
         // agent enforces its own ceiling rather than trusting the count.
         let flood = (0..500).map(|id| task(id, "f:6", 60)).collect();
-        respawn_ping_tasks(&mut running, flood, &tx);
+        respawn_ping_tasks(&mut running, flood, &tx, &probes);
         assert_eq!(running.len(), MAX_PING_TASKS, "the hub does not choose how many probes run");
     }
     #[tokio::test(start_paused = true)]

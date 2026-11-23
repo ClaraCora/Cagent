@@ -10,7 +10,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
-use nix::pty::{openpty, Winsize};
+use nix::pty::Winsize;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::{read, write, Pid};
 use serde::Deserialize;
@@ -191,20 +191,54 @@ struct Pty {
     pid: Pid,
 }
 
+#[cfg(target_os = "linux")]
+fn private_pty() -> Result<(OwnedFd, OwnedFd)> {
+    use rustix::fs::{open, Mode, OFlags};
+    use rustix::io::Errno;
+    use rustix::pty::{grantpt, ioctl_tiocgptpeer, openpt, ptsname, unlockpt, OpenptFlags};
+    let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
+    let master = openpt(flags)?;
+    grantpt(&master)?;
+    unlockpt(&master)?;
+    let slave = match ioctl_tiocgptpeer(&master, flags) {
+        Ok(slave) => slave,
+        Err(Errno::NOTTY | Errno::INVAL) => {
+            // Kernels predating TIOCGPTPEER still support atomic O_CLOEXEC.
+            let path = ptsname(&master, Vec::new())?;
+            open(path.as_c_str(), OFlags::from(flags) | OFlags::NOFOLLOW, Mode::empty())?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok((master, slave))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn private_pty() -> Result<(OwnedFd, OwnedFd)> {
+    use rustix::io::{fcntl_getfd, fcntl_setfd, FdFlags};
+    let pair = nix::pty::openpty(None, None)?;
+    for fd in [&pair.master, &pair.slave] {
+        fcntl_setfd(fd, fcntl_getfd(fd)? | FdFlags::CLOEXEC)?;
+    }
+    Ok((pair.master, pair.slave))
+}
+
 impl Pty {
     fn spawn(cols: u32, rows: u32) -> Result<Self> {
         let size = winsize(cols, rows);
-        let pair = openpty(Some(&size), None).context("create PTY")?;
-        set_nonblocking(pair.master.as_raw_fd()).context("set PTY nonblocking")?;
-        let stdin = pair.slave.try_clone().context("clone PTY slave")?;
-        let stdout = pair.slave.try_clone().context("clone PTY slave")?;
+        let (master, slave) = private_pty().context("create PTY")?;
+        if unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &size) } == -1 {
+            return Err(io::Error::last_os_error()).context("initialize PTY window");
+        }
+        set_nonblocking(master.as_raw_fd()).context("set PTY nonblocking")?;
+        let stdin = slave.try_clone().context("clone PTY slave")?;
+        let stdout = slave.try_clone().context("clone PTY slave")?;
         let shell = if Path::new("/bin/bash").is_file() { "/bin/bash" } else { "/bin/sh" };
         let mut command = tokio::process::Command::new(shell);
         command
             .arg("-l")
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(pair.slave))
+            .stderr(Stdio::from(slave))
             .env_remove("MONITOR_TOKEN")
             .env_remove("MONITOR_SERVER")
             .kill_on_drop(true);
@@ -225,7 +259,7 @@ impl Pty {
         let pid = Pid::from_raw(child.id().ok_or_else(|| anyhow::anyhow!("shell has no process id"))? as i32);
         // SAFETY: AsyncFd owns this OwnedFd until deregistration. It is never
         // replaced or closed through a raw descriptor while registered.
-        let master = unsafe { AsyncFd::register(pair.master)? };
+        let master = unsafe { AsyncFd::register(master)? };
         Ok(Self { master, child, pid })
     }
 
@@ -384,6 +418,14 @@ fn errno(error: nix::errno::Errno) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_pty_descriptors_are_closed_on_exec() {
+        let (master, slave) = private_pty().unwrap();
+        for fd in [&master, &slave] {
+            assert!(rustix::io::fcntl_getfd(fd).unwrap().contains(rustix::io::FdFlags::CLOEXEC));
+        }
+    }
 
     #[tokio::test]
     async fn plaintext_terminal_is_refused_without_starting_a_shell() {

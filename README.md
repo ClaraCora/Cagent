@@ -30,14 +30,24 @@ curl -fsSL https://your-hub/install.sh | sh -s -- --server https://your-hub --to
 ## 运行
 
 ```bash
-monitor-agent --server https://your-hub --token <token>
+monitor-agent --server https://your-hub --token-file /opt/monitor/node.token
 ```
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--server` | 必填 | hub 地址，也可用 `MONITOR_SERVER` |
-| `--token` | 必填 | 节点 token，也可用 `MONITOR_TOKEN` |
+| `--token-file` | 可选 | 单行节点 Token 文件，属主为 root 或运行 Agent 的用户，权限设为 `0600`。常规服务安装继续从环境文件读取 `MONITOR_TOKEN`。旧参数 `--token` 仍可用，值会出现在进程命令行。 |
 | `--interval` | 1 | 上报间隔（秒），1–3600 |
+
+Web Terminal 需要 WSS 连接，本机回环的明文连接仅用于上报与已获准的探测。可在服务环境文件设置 `MONITOR_DISABLE_TERMINAL=true` 关闭终端。填写无法识别的值时也会关闭终端，监控上报继续运行。
+
+HTTP 节点默认只上报指标。若需要延迟探测，在节点的 `/opt/monitor/agent.env` 设置 `MONITOR_HTTP_PROBE_ALLOWLIST`，重启 Agent 后生效。列表以逗号分隔，每项指定 IP 和端口，或域名、端口及允许的解析 IP。多个解析 IP 用 `|` 分隔。只有 Hub 已分配且在列表中的目标会被探测。以下为示例地址，请换成实际监测目标。使用引号可兼容 OpenRC。
+
+```ini
+MONITOR_HTTP_PROBE_ALLOWLIST="192.0.2.1:443,[2001:db8::1]:80,latency.example:443=192.0.2.2|2001:db8::2"
+```
+
+域名解析到其他地址时，Agent 会跳过该地址。名单格式无效时会停止 HTTP 延迟探测，修正并重启后恢复。
 
 ## 上报字段
 

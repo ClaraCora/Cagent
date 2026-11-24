@@ -16,7 +16,7 @@ use tokio::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{Sink, SinkExt, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -148,10 +148,18 @@ struct PingTask {
     interval: u64,
 }
 
-fn notify(method: &str, params: serde_json::Value) -> Message {
-    Message::Text(
-        serde_json::json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string().into(),
-    )
+#[derive(Serialize)]
+struct Notification<'a, T> {
+    jsonrpc: &'static str,
+    method: &'a str,
+    params: T,
+}
+
+fn notify(method: &str, params: impl Serialize) -> serde_json::Result<Message> {
+    // Write the metric struct straight to the socket payload. Going through Value
+    // allocates an object for every sample and widens f32 numbers before printing.
+    let text = serde_json::to_string(&Notification { jsonrpc: "2.0", method, params })?;
+    Ok(Message::Text(text.into()))
 }
 
 /// Writes under a deadline drawn from the remaining silence budget.
@@ -252,10 +260,16 @@ fn reconnect_wait(previous: u64, lasted: Duration) -> u64 {
 /// which nothing is expected to arrive.
 const CONNECT_DEADLINE: Duration = Duration::from_secs(120);
 
-/// The hub sends one kind of message, a probe list a few hundred bytes long.
-/// Tungstenite's 64 MiB default would hand the peer this process's entire
-/// memory budget.
+/// Bound incoming probe lists and terminal commands independently of the
+/// working buffer. Larger permitted frames are read in chunks.
 const MAX_MESSAGE: usize = 64 * 1024;
+
+fn socket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .read_buffer_size(8 * 1024)
+        .max_message_size(Some(MAX_MESSAGE))
+        .max_frame_size(Some(MAX_MESSAGE))
+}
 
 /// How long the agent waits for any frame from the hub before giving up.
 ///
@@ -286,8 +300,7 @@ async fn session(
     request
         .headers_mut()
         .insert("authorization", format!("Bearer {token}").parse().context("token is not header-safe")?);
-    let config =
-        WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
+    let config = socket_config();
     let connect = tokio_tungstenite::connect_async_with_config(request, Some(config), false);
     let (mut ws, _) = tokio::time::timeout(CONNECT_DEADLINE, connect)
         .await
@@ -310,7 +323,7 @@ async fn session(
         "available"
     });
     facts["network_interfaces"] = serde_json::json!(collect::active_interfaces());
-    send(&mut ws, notify("hello", facts), remaining(last_frame)).await?;
+    send(&mut ws, notify("hello", facts)?, remaining(last_frame)).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
@@ -321,8 +334,11 @@ async fn session(
     let result = loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let m = serde_json::to_value(collector.collect())?;
-                if let Err(e) = send(&mut ws, notify("report", m), remaining(last_frame)).await { break Err(e); }
+                let message = match notify("report", collector.collect()) {
+                    Ok(message) => message,
+                    Err(error) => break Err(error.into()),
+                };
+                if let Err(e) = send(&mut ws, message, remaining(last_frame)).await { break Err(e); }
             }
             // Rebuilt each pass from the last frame, so silence costs exactly
             // HUB_SILENCE rather than a polling interval more. Kept separate
@@ -346,7 +362,10 @@ async fn session(
                                 }
                             } else if rpc.method == "terminal.open" && !terminal_enabled {
                                 let id = rpc.params.get("terminal_id").cloned().unwrap_or_default();
-                                let _ = result_tx.try_send(notify("terminal.error", serde_json::json!({"terminal_id": id, "message": "Agent 已在本机禁用 Web Terminal"})));
+                                let params = serde_json::json!({"terminal_id": id, "message": "Agent 已在本机禁用 Web Terminal"});
+                                if let Ok(msg) = notify("terminal.error", params) {
+                                    let _ = result_tx.try_send(msg);
+                                }
                             } else if rpc.method.starts_with("terminal.") {
                                 terminals.handle(&rpc.method, rpc.params, &result_tx, secure_transport).await;
                             }
@@ -429,6 +448,7 @@ fn respawn_ping_tasks(
                         "task_id": spawned.id, "latency_ms": latency, "reason": reason
                     }),
                 );
+                let Ok(msg) = msg else { continue };
                 if tx.send(msg).await.is_err() {
                     return;
                 }
@@ -499,6 +519,49 @@ async fn handshake(addresses: impl Iterator<Item = std::net::SocketAddr>) -> i32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_reports_round_trip_all_fields_and_exact_byte_counters() {
+        for cpu in [0.0, 17.1, 99.987_65] {
+            let metrics = collect::Metrics {
+                boot_id: "test-boot".into(),
+                cpu,
+                load: [0.03, 1.12, 13.37],
+                net_rx_total: (1 << 53) + 1,
+                net_tx_total: i64::MAX as u64 - 1,
+                ..Default::default()
+            };
+            let old = serde_json::json!({"jsonrpc":"2.0","method":"report","params":metrics});
+            let msg = notify("report", &metrics).unwrap();
+            let text = msg.to_text().unwrap();
+            let mut decoded: serde_json::Value = serde_json::from_str(text).unwrap();
+            // The shorter spelling must recover the identical measured f32. All
+            // other fields, including integer zeros and counters, must match exactly.
+            assert_eq!(decoded["params"]["cpu"].as_f64().unwrap() as f32, cpu);
+            for (item, expected) in decoded["params"]["load"].as_array().unwrap().iter().zip(metrics.load) {
+                assert_eq!(item.as_f64().unwrap() as f32, expected);
+            }
+            assert_eq!(decoded["params"]["load"].as_array().unwrap().len(), 3);
+            for key in ["cpu", "load"] {
+                decoded["params"][key] = old["params"][key].clone();
+            }
+            assert_eq!(decoded, old);
+            assert!(text.len() < old.to_string().len());
+        }
+    }
+
+    #[tokio::test]
+    async fn small_read_buffer_delivers_large_commands_and_keeps_the_message_limit() {
+        use tokio_tungstenite::{tungstenite::protocol::Role, WebSocketStream};
+        let (left, right) = tokio::io::duplex(2 * MAX_MESSAGE);
+        let mut client = WebSocketStream::from_raw_socket(left, Role::Client, Some(socket_config())).await;
+        let mut server = WebSocketStream::from_raw_socket(right, Role::Server, None).await;
+        let payload = "x".repeat(MAX_MESSAGE);
+        server.send(Message::text(payload.clone())).await.unwrap();
+        assert_eq!(client.next().await.unwrap().unwrap().to_text().unwrap(), payload);
+        server.send(Message::text(payload + "x")).await.unwrap();
+        assert!(matches!(client.next().await, Some(Err(WsError::Capacity(_)))));
+    }
 
     #[test]
     fn plaintext_loopback_may_report_but_never_opens_a_terminal() {
@@ -669,9 +732,13 @@ mod tests {
 
         // A stalled hello must fail at the budget it was handed, not one of
         // its own.
-        assert!(send(&mut NeverDrains, notify("hello", serde_json::json!({})), remaining(handshake))
-            .await
-            .is_err());
+        assert!(send(
+            &mut NeverDrains,
+            notify("hello", serde_json::json!({})).unwrap(),
+            remaining(handshake)
+        )
+        .await
+        .is_err());
         assert_eq!(handshake.elapsed(), HUB_SILENCE, "the stall costs the budget, no more");
 
         // Afterwards the give-up moment stays at last_frame + HUB_SILENCE:

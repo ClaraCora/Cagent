@@ -1,8 +1,9 @@
 //! Linux-only metric collection, read directly from /proc and statvfs.
 //! sysinfo is not used: it misreports memory and disk for this purpose.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::time::Instant;
 
 use serde::Serialize;
@@ -126,6 +127,8 @@ pub struct Metrics {
 
 #[derive(Default)]
 pub struct Collector {
+    mounts: MountTable,
+    boot_id: Option<String>,
     prev_cpu: Option<(u64, u64)>,
     prev_net: Option<(Instant, u64, u64)>,
 }
@@ -135,11 +138,11 @@ impl Collector {
         Self::default()
     }
 
-    pub fn facts(&self) -> Facts {
+    pub fn facts(&mut self) -> Facts {
         let (v4, v6) = addresses();
         let mem = meminfo();
         let (cpu_name, cpu_cores) = cpuinfo();
-        let (disk_total, _) = disk_usage(&real_mount_points());
+        let (disk_total, _) = disk_usage(self.mounts.paths("/proc/self/mounts"));
         Facts {
             hostname: read_trim("/proc/sys/kernel/hostname").unwrap_or_else(|| "unknown".into()),
             os: os_pretty_name(),
@@ -148,8 +151,8 @@ impl Collector {
             virt: virtualization(),
             cpu_name,
             cpu_cores,
-            mem_total: mem.get("MemTotal").copied().unwrap_or(0),
-            swap_total: mem.get("SwapTotal").copied().unwrap_or(0),
+            mem_total: mem.total,
+            swap_total: mem.swap_total,
             disk_total,
             agent_version: env!("CARGO_PKG_VERSION").into(),
             ipv4: v4,
@@ -161,13 +164,13 @@ impl Collector {
         let mem = meminfo();
         let (mem_total, mem_used) = mem_used(&mem);
         let (swap_total, swap_used) = swap_used(&mem);
-        let (disk_total, disk_used) = disk_usage(&real_mount_points());
+        let (disk_total, disk_used) = disk_usage(self.mounts.paths("/proc/self/mounts"));
         let (rx_total, tx_total) = net_totals();
         let (rx, tx) = self.net_rate(rx_total, tx_total, Instant::now());
         let (tcp, udp) = conn_counts();
 
         Metrics {
-            boot_id: accounting_boot_id(),
+            boot_id: self.boot_id(|| read_trim("/proc/sys/kernel/random/boot_id")),
             uptime: uptime(),
             cpu: self.cpu_percent(),
             load: loadavg(),
@@ -185,6 +188,21 @@ impl Collector {
             udp,
             procs: proc_count(),
         }
+    }
+
+    // A process cannot survive a host reboot. Cache only a successful read so
+    // a transiently missing procfs file is retried at the next report.
+    fn boot_id(&mut self, read: impl FnOnce() -> Option<String>) -> String {
+        if let Some(value) = &self.boot_id {
+            return value.clone();
+        }
+        let raw = read().unwrap_or_default();
+        let cacheable = !raw.is_empty();
+        let value = accounting_boot_id(raw);
+        if cacheable {
+            self.boot_id = Some(value.clone());
+        }
+        value
     }
 
     /// CPU busy share since the previous call. The first call has no baseline
@@ -224,47 +242,58 @@ fn read_trim(path: &str) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_owned())
 }
 
-/// Parses /proc/meminfo into bytes keyed by field name.
-fn meminfo() -> HashMap<String, u64> {
+#[derive(Default)]
+struct MemInfo {
+    total: u64,
+    free: u64,
+    available: Option<u64>,
+    buffers: u64,
+    cached: u64,
+    swap_total: u64,
+    swap_free: u64,
+}
+
+fn meminfo() -> MemInfo {
     parse_meminfo(&fs::read_to_string("/proc/meminfo").unwrap_or_default())
 }
 
-fn parse_meminfo(text: &str) -> HashMap<String, u64> {
-    text.lines()
-        .filter_map(|line| {
-            let (key, rest) = line.split_once(':')?;
-            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-            Some((key.to_owned(), kb * 1024))
-        })
-        .collect()
-}
-
-/// `free(1)`'s used column: total minus the kernel's MemAvailable estimate.
-/// sysinfo's `used_memory()` counts page cache as used and reads gigabytes high
-/// on a host that has been up for a while.
-fn mem_used(m: &HashMap<String, u64>) -> (u64, u64) {
-    let g = |k: &str| m.get(k).copied().unwrap_or(0);
-    let total = g("MemTotal");
-    if total == 0 {
-        return (0, 0);
+fn parse_meminfo(text: &str) -> MemInfo {
+    let mut m = MemInfo::default();
+    for line in text.lines() {
+        let Some((key, rest)) = line.split_once(':') else { continue };
+        let bytes = || rest.split_whitespace().next()?.parse::<u64>().ok()?.checked_mul(1024);
+        let slot = match key {
+            "MemTotal" => &mut m.total,
+            "MemFree" => &mut m.free,
+            "MemAvailable" => {
+                if let Some(value) = bytes() {
+                    m.available = Some(value);
+                }
+                continue;
+            }
+            "Buffers" => &mut m.buffers,
+            "Cached" => &mut m.cached,
+            "SwapTotal" => &mut m.swap_total,
+            "SwapFree" => &mut m.swap_free,
+            _ => continue,
+        };
+        if let Some(value) = bytes() {
+            *slot = value;
+        }
     }
-    // Absence selects the fallback, not a zero value: a host under real memory
-    // pressure reports MemAvailable 0, and treating that as a missing field
-    // would understate used memory precisely when it matters.
-    let available =
-        m.get("MemAvailable").copied().unwrap_or_else(|| g("MemFree") + g("Buffers") + g("Cached"));
-    (total, total.saturating_sub(available))
+    m
 }
 
-/// `free(1)`'s Swap used column: `SwapTotal - SwapFree`, nothing more.
-///
-/// Subtracting `SwapCached` would imply that pages swapped back in had released
-/// their slots. They have not -- the copy on the device still occupies blocks
-/// until something else claims them -- and the result runs about a fifth low.
-fn swap_used(m: &HashMap<String, u64>) -> (u64, u64) {
-    let g = |k: &str| m.get(k).copied().unwrap_or(0);
-    let total = g("SwapTotal");
-    (total, total.saturating_sub(g("SwapFree")))
+/// Matches free(1). Only older kernels with no MemAvailable field get the
+/// fallback. Zero is a valid reading on a host under pressure.
+fn mem_used(m: &MemInfo) -> (u64, u64) {
+    let available = m.available.unwrap_or_else(|| m.free.saturating_add(m.buffers).saturating_add(m.cached));
+    (m.total, m.total.saturating_sub(available))
+}
+
+/// SwapCached still occupies device blocks, so it is included in used swap.
+fn swap_used(m: &MemInfo) -> (u64, u64) {
+    (m.swap_total, m.swap_total.saturating_sub(m.swap_free))
 }
 
 /// Busy share between two `(total, idle)` jiffy readings.
@@ -282,19 +311,23 @@ fn busy_percent(prev: (u64, u64), now: (u64, u64)) -> f32 {
 }
 
 fn cpu_jiffies() -> Option<(u64, u64)> {
-    parse_cpu_jiffies(&fs::read_to_string("/proc/stat").ok()?)
+    // Only the aggregate row is used. The rest grows with CPU and IRQ count.
+    let mut reader = BufReader::with_capacity(256, fs::File::open("/proc/stat").ok()?);
+    let mut line = String::with_capacity(128);
+    reader.read_line(&mut line).ok()?;
+    parse_cpu_jiffies(&line)
 }
 
 fn parse_cpu_jiffies(text: &str) -> Option<(u64, u64)> {
     let line = text.lines().next()?.strip_prefix("cpu ")?;
-    let v: Vec<u64> = line.split_whitespace().filter_map(|f| f.parse().ok()).collect();
-    if v.len() < 5 {
-        return None;
-    }
-    // idle and iowait are both time the CPU did no work. guest and guest_nice
-    // are already included in user and nice, so the sum stops before them
-    // rather than counting that time twice.
-    Some((v.iter().take(8).sum(), v[3] + v[4]))
+    let mut values = line.split_whitespace().filter_map(|f| f.parse::<u64>().ok());
+    let user = values.next()?;
+    let nice = values.next()?;
+    let system = values.next()?;
+    // Idle includes iowait. The next three fields are irq, softirq and steal.
+    // Guest time is already included in user and nice.
+    let idle = values.next()? + values.next()?;
+    Some((user + nice + system + idle + values.take(3).sum::<u64>(), idle))
 }
 
 fn loadavg() -> [f32; 3] {
@@ -348,11 +381,11 @@ fn parse_net_dev(text: &str) -> (u64, u64) {
         if !account_iface(name) {
             continue;
         }
-        let f: Vec<u64> = rest.split_whitespace().filter_map(|v| v.parse().ok()).collect();
-        if f.len() >= 9 {
-            rx = rx.saturating_add(f[0]);
-            tx = tx.saturating_add(f[8]);
-        }
+        let mut columns = rest.split_whitespace();
+        let Some(received) = columns.next().and_then(|n| n.parse::<u64>().ok()) else { continue };
+        let Some(sent) = columns.nth(7).and_then(|n| n.parse::<u64>().ok()) else { continue };
+        rx = rx.saturating_add(received);
+        tx = tx.saturating_add(sent);
     }
     (rx, tx)
 }
@@ -396,8 +429,7 @@ pub fn active_interfaces() -> Vec<String> {
         .map(str::to_owned)
         .collect()
 }
-fn accounting_boot_id() -> String {
-    let boot = read_trim("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+fn accounting_boot_id(boot: String) -> String {
     let (include, exclude) = accounting_config();
     if include.is_empty() && exclude.is_empty() {
         return boot;
@@ -431,54 +463,81 @@ fn skip_fstype(fstype: &str) -> bool {
     SKIP_FSTYPES.iter().any(|s| fstype == *s || fstype.strip_prefix(s).is_some_and(|r| r.starts_with('.')))
 }
 
-/// Mount points backed by real storage, deduplicated by source device so a bind
-/// mount or a second subvolume cannot double-count the same disk.
-///
-/// Re-read every sample rather than cached at startup, otherwise a disk attached
-/// later stays invisible until the agent restarts. /proc/self/mounts is a few
-/// kilobytes.
-fn real_mount_points() -> Vec<String> {
-    parse_mounts(&fs::read_to_string("/proc/self/mounts").unwrap_or_default())
+/// poll(2) on an open /proc/self/mounts reports changes in this mount
+/// namespace. Cache only the paths: statvfs still reads capacity every tick.
+#[derive(Default)]
+struct MountTable {
+    paths: Vec<String>,
+    watch: Option<(fs::File, Instant)>,
 }
 
-fn mount_rows(text: &str) -> Vec<(&str, &str, &str)> {
-    text.lines()
-        .filter_map(|line| {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            (f.len() >= 3).then(|| (f[0], f[1], f[2]))
-        })
-        .collect()
+impl MountTable {
+    fn paths(&mut self, path: &str) -> &[String] {
+        #[cfg(target_os = "linux")]
+        if let Some((file, opened)) = self.watch.as_ref() {
+            // Periodically reopen as a backstop for restricted or emulated procfs.
+            if opened.elapsed().as_secs() < 60 && mounts_unchanged(file) {
+                return &self.paths;
+            }
+        }
+        self.watch = None;
+        // Open before reading: any change racing this read is already pending
+        // on the new descriptor. A failed read retries on the next sample.
+        let mut text = String::new();
+        self.paths = fs::File::open(path)
+            .and_then(|mut file| {
+                std::io::Read::read_to_string(&mut file, &mut text)?;
+                #[cfg(target_os = "linux")]
+                if rustix::fs::fstatfs(&file).is_ok_and(|fs| fs.f_type == rustix::fs::PROC_SUPER_MAGIC) {
+                    self.watch = Some((file, Instant::now()));
+                }
+                Ok(parse_mounts(&text))
+            })
+            .unwrap_or_default();
+        &self.paths
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn mounts_unchanged(file: &fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut pollfd = libc::pollfd { fd: file.as_raw_fd(), events: libc::POLLPRI, revents: 0 };
+    // SAFETY: the descriptor and one-element array remain valid for this call.
+    // POLLPRI | POLLERR signals a new mount table. Errors also force a fresh read.
+    unsafe { libc::poll(&mut pollfd, 1, 0) == 0 }
+}
+
+fn mount_rows(text: &str) -> impl DoubleEndedIterator<Item = (&str, &str, &str)> {
+    text.lines().filter_map(|line| {
+        let mut fields = line.split_whitespace();
+        Some((fields.next()?, fields.next()?, fields.next()?))
+    })
 }
 
 fn parse_mounts(text: &str) -> Vec<String> {
-    let mut seen = Vec::new();
-    let mut out = Vec::new();
-    let rows = mount_rows(text);
-    for (i, &(dev, mount, fstype)) in rows.iter().enumerate() {
-        // The table is in mount order and a path resolves to the last mount on
-        // it, which is what statvfs below answers for. An earlier entry for the
-        // same point remains listed but is no longer reachable: under
-        // ProtectHome=yes a host whose /home is its own filesystem has that row
-        // sitting beneath a tmpfs, and counting it would book the tmpfs's size
-        // as /home's.
-        if rows[i + 1..].iter().any(|(_, m, _)| *m == mount) {
-            continue;
-        }
-        if skip_fstype(fstype) {
+    // A path resolves to its last mount. Walking backwards visits that mount
+    // first, including pseudo filesystems that cover an earlier real disk.
+    let mut paths = HashSet::new();
+    let mut visible = Vec::new();
+    for (dev, mount, fstype) in mount_rows(text).rev() {
+        if !paths.insert(mount) || skip_fstype(fstype) {
             continue;
         }
         if !dev.starts_with('/') && fstype != "zfs" && fstype != "btrfs" {
             continue;
         }
-        // ZFS datasets and btrfs subvolumes share one pool's free space.
-        let key = dev.split('/').next().filter(|_| fstype == "zfs").unwrap_or(dev).to_owned();
-        if seen.contains(&key) {
-            continue;
-        }
-        seen.push(key);
-        out.push(mount.replace("\\040", " "));
+        let device = if fstype == "zfs" { dev.split('/').next().unwrap_or(dev) } else { dev };
+        visible.push((device, mount));
     }
-    out
+
+    // Restore mount order so the first visible path of each device/pool wins.
+    let mut devices = HashSet::new();
+    visible
+        .into_iter()
+        .rev()
+        .filter(|(dev, _)| devices.insert(*dev))
+        .map(|(_, mount)| mount.replace("\\040", " "))
+        .collect()
 }
 
 /// Mount points where a real filesystem sits beneath one this agent does not
@@ -490,7 +549,7 @@ fn parse_mounts(text: &str) -> Vec<String> {
 /// disagree by its entire size. Reported once at startup, since the discrepancy
 /// is otherwise visible only in the totals themselves.
 pub fn shadowed_mounts(text: &str) -> Vec<String> {
-    let rows = mount_rows(text);
+    let rows: Vec<_> = mount_rows(text).collect();
     rows.iter()
         .enumerate()
         .filter(|(i, (dev, mount, fstype))| {
@@ -635,7 +694,7 @@ mod tests {
         assert_eq!(total, 4008884 * 1024);
         assert_eq!(used, (4008884 - 2947484) * 1024, "must match the `free` used column");
         // Counting cache as used would report ~3.3 GiB here.
-        assert!(used < (total - g_cached(&m)), "page cache must not count as used");
+        assert!(used < (total - m.cached), "page cache must not count as used");
 
         // free's Swap used column is total - free. SwapCached is not
         // subtracted: those pages still occupy their blocks on the device.
@@ -644,15 +703,26 @@ mod tests {
         assert_eq!(su, (1048572 - 987264) * 1024, "must match the `free` swap used column");
     }
 
-    fn g_cached(m: &HashMap<String, u64>) -> u64 {
-        m.get("Cached").copied().unwrap_or(0)
-    }
-
     #[test]
     fn memory_falls_back_when_memavailable_is_absent() {
         let m = parse_meminfo("MemTotal: 1000 kB\nMemFree: 200 kB\nBuffers: 100 kB\nCached: 300 kB\n");
         assert_eq!(mem_used(&m), (1000 * 1024, 400 * 1024));
-        assert_eq!(mem_used(&HashMap::new()), (0, 0));
+        assert_eq!(mem_used(&MemInfo::default()), (0, 0));
+    }
+
+    #[test]
+    fn zero_available_memory_is_distinct_from_a_missing_estimate() {
+        let m = parse_meminfo("Cached: 400 kB\nMemAvailable: 0 kB\nMemTotal: 1000 kB\n");
+        assert_eq!(mem_used(&m), (1000 * 1024, 1000 * 1024));
+    }
+
+    #[test]
+    fn boot_id_retries_after_failure_and_reuses_the_successful_accounting_id() {
+        let mut c = Collector::new();
+        assert_eq!(c.boot_id(|| None), accounting_boot_id(String::new()));
+        let expected = accounting_boot_id("kernel-boot".into());
+        assert_eq!(c.boot_id(|| Some("kernel-boot".into())), expected);
+        assert_eq!(c.boot_id(|| panic!("boot_id is constant for the life of this process")), expected);
     }
 
     #[test]
@@ -742,6 +812,63 @@ mod tests {
     /// its source looks like a device. Most entries trip both, so the table
     /// includes a line that only one of them catches.
     #[test]
+    fn mount_table_reopens_a_plain_file_and_recovers_after_a_missing_read() {
+        let path = std::env::temp_dir().join(format!("monitor-mounts-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let mut mounts = MountTable::default();
+        fs::write(path, "/dev/a /one ext4 rw 0 0\n").unwrap();
+        assert_eq!(mounts.paths(path), ["/one"]);
+        fs::remove_file(path).unwrap();
+        assert!(mounts.paths(path).is_empty());
+        fs::write(path, "/dev/b /two xfs rw 0 0\n").unwrap();
+        assert_eq!(mounts.paths(path), ["/two"]);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Run using `unshare --mount --propagation private`: the temporary
+    /// mounts must never propagate to the host.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a private Linux mount namespace with CAP_SYS_ADMIN"]
+    fn a_private_mount_change_is_visible_on_the_next_sample() {
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(
+            fs::metadata("/proc/self/ns/mnt").unwrap().ino(),
+            fs::metadata("/proc/1/ns/mnt").unwrap().ino()
+        );
+        let info = fs::read_to_string("/proc/self/mountinfo").unwrap();
+        assert!(!info.lines().any(|l| l
+            .split(" - ")
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .any(|f| f.starts_with("shared:"))));
+        let base = std::env::temp_dir().join(format!("monitor-mount-changes-{}", std::process::id()));
+        fs::create_dir(&base).unwrap();
+        let dst = base.to_str().unwrap();
+        let mut mounts = MountTable::default();
+        let table = "/proc/self/mounts";
+        let initial = mounts.paths(table).to_vec();
+        assert!(mounts_unchanged(&mounts.watch.as_ref().unwrap().0));
+        assert!(std::process::Command::new("mount")
+            .args(["-t", "tmpfs", "-o", "size=1m", "none", dst])
+            .status()
+            .unwrap()
+            .success());
+        let mounted = fs::read_to_string(table).unwrap();
+        assert!(mounted.lines().any(|l| l.split_whitespace().nth(1) == Some(dst)));
+        let opened = mounts.watch.as_ref().unwrap().1;
+        assert_eq!(mounts.paths(table), parse_mounts(&mounted));
+        assert!(mounts.watch.as_ref().unwrap().1 > opened);
+        assert!(mounts_unchanged(&mounts.watch.as_ref().unwrap().0));
+        assert!(std::process::Command::new("umount").arg(dst).status().unwrap().success());
+        let opened = mounts.watch.as_ref().unwrap().1;
+        assert_eq!(mounts.paths(table), initial);
+        assert!(mounts.watch.as_ref().unwrap().1 > opened);
+        fs::remove_dir(base).unwrap();
+    }
+
+    #[test]
     fn mounts_drop_pseudo_filesystems_and_duplicate_devices() {
         let mounts = parse_mounts(
             "/dev/vda1 / ext4 rw 0 0\n\
@@ -767,6 +894,18 @@ mod tests {
         // and only `fuse` as a whole covers the pool. A block device behind a
         // fuse driver mounts as `fuseblk` and still counts.
         assert_eq!(mounts, vec!["/", "/data", "/tank"]);
+    }
+
+    #[test]
+    fn a_device_uses_its_first_visible_path_after_multiple_overmounts() {
+        let mounts = "/dev/vda1 / ext4 rw 0 0\n\
+                      /dev/vdb1 /data ext4 rw 0 0\n\
+                      /dev/vdc1 /data ext4 rw 0 0\n\
+                      /dev/vdb1 /my\\040data ext4 rw 0 0\n\
+                      tmpfs /data tmpfs rw 0 0\n\
+                      /dev/vdc1 /other ext4 rw 0 0\n\
+                      /dev/vdb1 /later ext4 rw 0 0\n";
+        assert_eq!(parse_mounts(mounts), ["/", "/my data", "/other"]);
     }
 
     /// `install.sh` runs this agent with `ProtectHome=yes`, which systemd

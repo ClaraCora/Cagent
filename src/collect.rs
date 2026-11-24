@@ -338,6 +338,20 @@ fn loadavg() -> [f32; 3] {
 }
 
 fn uptime() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        // The first /proc/uptime column uses the boot clock, including suspend.
+        // Reading that file also asks the kernel to sum idle time over every CPU.
+        let mut value = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        // SAFETY: on success clock_gettime initializes the supplied timespec.
+        if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, value.as_mut_ptr()) } == 0 {
+            return unsafe { value.assume_init() }.tv_sec.max(0) as u64;
+        }
+    }
+    proc_uptime()
+}
+
+fn proc_uptime() -> u64 {
     fs::read_to_string("/proc/uptime")
         .ok()
         .and_then(|t| t.split_whitespace().next()?.parse::<f64>().ok())
@@ -616,6 +630,33 @@ fn parse_sockstat(v4: &str, v6: &str) -> (u32, u32) {
     )
 }
 
+#[cfg(target_os = "linux")]
+fn proc_count() -> u32 {
+    count_pids(std::path::Path::new("/proc"))
+}
+
+#[cfg(target_os = "linux")]
+fn count_pids(directory: &std::path::Path) -> u32 {
+    use rustix::fs::RawDir;
+    use std::mem::MaybeUninit;
+
+    let Ok(file) = fs::File::open(directory) else { return 0 };
+    // Count the visible top-level PIDs in this namespace. Each name borrows
+    // from one batch of directory entries, including on high-process hosts.
+    let mut buffer = [MaybeUninit::<u8>::uninit(); 8192];
+    let mut entries = RawDir::new(file, &mut buffer);
+    let mut count = 0;
+    while let Some(entry) = entries.next() {
+        match entry {
+            Ok(entry) => count += u32::from(entry.file_name().to_bytes().iter().all(u8::is_ascii_digit)),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(_) => break,
+        }
+    }
+    count
+}
+
+#[cfg(not(target_os = "linux"))]
 fn proc_count() -> u32 {
     fs::read_dir("/proc")
         .map(|d| {
@@ -742,6 +783,34 @@ mod tests {
         assert_eq!(busy_percent((1000, 925), (500, 400)), 0.0);
         // The first call has no baseline, so it reports 0.
         assert_eq!(Collector::new().cpu_percent(), 0.0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn boot_clock_matches_the_proc_uptime_column() {
+        let before = proc_uptime();
+        let sampled = uptime();
+        let after = proc_uptime();
+        assert!(before > 0 && (before..=after).contains(&sampled));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn process_count_spans_batches_and_skips_nonnumeric_names() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = std::env::temp_dir().join(format!("cagent-pids-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        for id in 1..=400 {
+            fs::create_dir(root.join(id.to_string())).unwrap();
+        }
+        for name in [b"self".as_slice(), b"12x", b"x12", b"\xff"] {
+            fs::create_dir(root.join(std::ffi::OsStr::from_bytes(name))).unwrap();
+        }
+        assert_eq!(count_pids(&root), 400);
+        fs::remove_dir(root.join("400")).unwrap();
+        assert_eq!(count_pids(&root), 399);
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(count_pids(&root), 0);
     }
 
     #[test]
